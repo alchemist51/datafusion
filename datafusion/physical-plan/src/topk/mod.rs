@@ -691,8 +691,32 @@ impl RecordBatchStore {
     pub fn insert(&mut self, entry: RecordBatchEntry) {
         // uses of 0 means that none of the rows in the batch were stored in the topk
         if entry.uses > 0 {
-            self.batches_size += get_record_batch_memory_size(&entry.batch);
+            // Log BEFORE insert
+            let size_before = self.size();
+            let batches_count_before = self.batches.len();
+            let entry_size = get_record_batch_memory_size(&entry.batch);
+            
+            log::info!(
+                "[TOPK-MEMORY] BEFORE insert: total={}KB, batches_count={}, batches_size={}KB, entry_uses={}",
+                size_before / 1024,
+                batches_count_before,
+                self.batches_size / 1024,
+                entry.uses
+            );
+            
+            self.batches_size += entry_size;
             self.batches.insert(entry.id, entry);
+            
+            // Log AFTER insert
+            let size_after = self.size();
+            log::info!(
+                "[TOPK-MEMORY] AFTER insert: total={}KB, batches_count={}, batches_size={}KB, entry_added={}KB, memory_increase={}KB",
+                size_after / 1024,
+                self.batches.len(),
+                self.batches_size / 1024,
+                entry_size / 1024,
+                (size_after - size_before) / 1024
+            );
         }
     }
 

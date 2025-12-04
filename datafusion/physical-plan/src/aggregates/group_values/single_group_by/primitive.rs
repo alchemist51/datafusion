@@ -428,7 +428,7 @@ where
         assert_eq!(cols.len(), 1);
         groups.clear();
 
-        let block_size = self.block_size.unwrap_or_default();
+        let _block_size = self.block_size.unwrap_or_default();
         for v in cols[0].as_primitive::<T>() {
             let group_index = match v {
                 None => *self.null_group.get_or_insert_with(|| {

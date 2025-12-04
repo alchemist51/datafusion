@@ -155,7 +155,7 @@ impl GroupsAccumulatorAdapter {
         for _ in 0..new_accumulators {
             let accumulator = (self.factory)()?;
             let state = AccumulatorState::new(accumulator);
-            self.add_allocation(state.size());
+            self.add_allocation(state.size()); // Why both time?
             self.states.push(state);
         }
 

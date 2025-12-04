@@ -32,6 +32,10 @@ pub struct GroupValuesBytesView {
     map: ArrowBytesViewMap<usize>,
     /// The total number of groups so far (used to assign group_index)
     num_groups: usize,
+    /// Block size for blocked emission (None = flat mode)
+    block_size: Option<usize>,
+    /// State for blocked emission: stores remaining data to emit
+    emit_state: Option<ArrayRef>,
 }
 
 impl GroupValuesBytesView {
@@ -39,6 +43,8 @@ impl GroupValuesBytesView {
         Self {
             map: ArrowBytesViewMap::new(output_type),
             num_groups: 0,
+            block_size: None,
+            emit_state: None,
         }
     }
 }
@@ -49,6 +55,10 @@ impl GroupValues for GroupValuesBytesView {
         cols: &[ArrayRef],
         groups: &mut Vec<usize>,
     ) -> datafusion_common::Result<()> {
+        if self.emit_state.is_some() {
+            return internal_err!("can not update groups during blocks emitting");
+        }
+        
         assert_eq!(cols.len(), 1);
 
         // look up / add entries in the table
@@ -88,19 +98,22 @@ impl GroupValues for GroupValuesBytesView {
     }
 
     fn emit(&mut self, emit_to: EmitTo) -> datafusion_common::Result<Vec<ArrayRef>> {
-        // Reset the map to default, and convert it into a single array
-        let map_contents = self.map.take().into_state();
-
         let group_values = match emit_to {
             EmitTo::All => {
+                assert!(self.block_size.is_none(), "only support EmitTo::All in flat mode");
+                let map_contents = self.map.take().into_state();
                 self.num_groups -= map_contents.len();
                 map_contents
             }
             EmitTo::First(n) if n == self.len() => {
+                assert!(self.block_size.is_none(), "only support EmitTo::First in flat mode");
+                let map_contents = self.map.take().into_state();
                 self.num_groups -= map_contents.len();
                 map_contents
             }
             EmitTo::First(n) => {
+                assert!(self.block_size.is_none(), "only support EmitTo::First in flat mode");
+                let map_contents = self.map.take().into_state();
                 // if we only wanted to take the first n, insert the rest back
                 // into the map we could potentially avoid this reallocation, at
                 // the expense of much more complex code.
@@ -119,9 +132,39 @@ impl GroupValues for GroupValuesBytesView {
                 emit_group_values
             }
             EmitTo::NextBlock => {
-                return internal_err!(
-                    "group_values_bytes_view does not support blocked groups"
-                )
+                let block_size = self.block_size.expect("only support EmitTo::NextBlock in blocked mode");
+                
+                // First call: initialize emit state
+                if self.emit_state.is_none() {
+                    let map_contents = self.map.take().into_state();
+                    self.emit_state = Some(map_contents);
+                }
+                
+                // Get the remaining data
+                let remaining = self.emit_state.as_ref().unwrap();
+                let remaining_len = remaining.len();
+                
+                if remaining_len == 0 {
+                    // All blocks emitted
+                    self.emit_state = None;
+                    return internal_err!("try to evaluate empty group values");
+                }
+                
+                // Emit one block
+                let emit_len = block_size.min(remaining_len);
+                let emit_group_values = remaining.slice(0, emit_len);
+                
+                // Update state
+                if emit_len < remaining_len {
+                    let new_remaining = remaining.slice(emit_len, remaining_len - emit_len);
+                    self.emit_state = Some(new_remaining);
+                } else {
+                    // Last block emitted
+                    self.emit_state = None;
+                }
+                
+                self.num_groups -= emit_len;
+                emit_group_values
             }
         };
 
@@ -132,5 +175,19 @@ impl GroupValues for GroupValuesBytesView {
         // in theory we could potentially avoid this reallocation and clear the
         // contents of the maps, but for now we just reset the map from the beginning
         self.map.take();
+        self.emit_state = None;
+        self.num_groups = 0;
+    }
+    
+    fn supports_blocked_groups(&self) -> bool {
+        true
+    }
+    
+    fn alter_block_size(&mut self, block_size: Option<usize>) -> datafusion_common::Result<()> {
+        self.map.take();
+        self.emit_state = None;
+        self.num_groups = 0;
+        self.block_size = block_size;
+        Ok(())
     }
 }

@@ -705,21 +705,37 @@ fn maybe_enable_blocked_groups(
     block_size: usize,
     group_ordering: &GroupOrdering,
 ) -> Result<bool> {
-    if !context
+    let config_enabled = context
         .session_config()
         .options()
         .execution
-        .enable_aggregation_blocked_groups
-        || !matches!(group_ordering, GroupOrdering::None)
-        || accumulators.is_empty()
-        || !matches!(context.memory_pool().memory_limit(), MemoryLimit::Infinite)
-    {
+        .enable_aggregation_blocked_groups;
+    let no_ordering = matches!(group_ordering, GroupOrdering::None);
+    let has_accumulators = !accumulators.is_empty();
+    
+    log::info!(
+        "[BLOCKED-GROUPS] Checking conditions: config_enabled={}, no_ordering={}, has_accumulators={}",
+        config_enabled, no_ordering, has_accumulators
+    );
+    
+    if !config_enabled || !no_ordering || !has_accumulators {
+        log::info!(
+            "[BLOCKED-GROUPS] Blocked optimization DISABLED due to: config={}, ordering={:?}, accumulators_empty={}",
+            config_enabled,
+            group_ordering,
+            accumulators.is_empty()
+        );
         return Ok(false);
     }
 
     let group_values_supports_blocked = group_values.supports_blocked_groups();
     let accumulators_support_blocked =
         accumulators.iter().all(|acc| acc.supports_blocked_groups());
+    
+    log::info!(
+        "[BLOCKED-GROUPS] Support check: group_values_supports={}, accumulators_support={}",
+        group_values_supports_blocked, accumulators_support_blocked
+    );
 
     match (group_values_supports_blocked, accumulators_support_blocked) {
         (true, true) => {
@@ -728,9 +744,24 @@ fn maybe_enable_blocked_groups(
             accumulators
                 .iter_mut()
                 .try_for_each(|acc| acc.alter_block_size(Some(block_size)))?;
+            log::info!(
+                "[BLOCKED-GROUPS] Blocked optimization ENABLED with block_size={}",
+                block_size
+            );
             Ok(true)
         }
-        _ => Ok(false),
+        _ => {
+            let group_values_type = std::any::type_name_of_val(group_values);
+            let accumulator_types: Vec<_> = accumulators
+                .iter()
+                .map(|acc| std::any::type_name_of_val(acc.as_ref()))
+                .collect();
+            log::info!(
+                "[BLOCKED-GROUPS] Blocked optimization DISABLED: group_values or accumulators don't support it. group_values_type={}, accumulator_types={:?}",
+                group_values_type, accumulator_types
+            );
+            Ok(false)
+        }
     }
 }
 
@@ -746,6 +777,7 @@ impl Stream for GroupedHashAggregateStream {
         loop {
             match &self.exec_state {
                 ExecutionState::ReadingInput => 'reading_input: {
+                    // Read this and understand it
                     match ready!(self.input.poll_next_unpin(cx)) {
                         // New batch to aggregate in partial aggregation operator
                         Some(Ok(batch)) if self.mode == AggregateMode::Partial => {
@@ -796,6 +828,7 @@ impl Stream for GroupedHashAggregateStream {
                             self.spill_previous_if_necessary(&batch)?;
 
                             // Do the grouping
+                            // Understand this code --> Forms group and update the Accumulators
                             self.group_aggregate_batch(batch)?;
 
                             // If we can begin emitting rows, do so,
@@ -804,6 +837,7 @@ impl Stream for GroupedHashAggregateStream {
 
                             // If the number of group values equals or exceeds the soft limit,
                             // emit all groups and switch to producing output
+                            // How soft group limit hit is coming into play here?
                             if self.hit_soft_group_limit() {
                                 timer.done();
                                 self.set_input_done_and_produce_output()?;
@@ -811,6 +845,7 @@ impl Stream for GroupedHashAggregateStream {
                                 break 'reading_input;
                             }
 
+                            // How emit to is working here?
                             if let Some(to_emit) = self.group_ordering.emit_to() {
                                 timer.done();
                                 if let Some(batch) = self.emit(to_emit, false)? {
@@ -902,12 +937,16 @@ impl Stream for GroupedHashAggregateStream {
                     //   - If found `Err`, throw it, end this stream abnormally
                     //   - If found `None`, it means all blocks are polled, end this stream normally
                     //   - If found `Some`, return it and wait next polling
+                    log::info!("[BLOCKED-GROUPS] ProducingBlocks(None): calling emit(NextBlock)");
                     let emit_result = self.emit(EmitTo::NextBlock, false);
                     let Ok(batch_opt) = emit_result else {
                         return Poll::Ready(Some(Err(emit_result.unwrap_err())));
                     };
 
                     // If Emit
+                    // ProducingBlocks(None) is called when the Emit is trying to produce the output
+                    // The below code after forming to emit, is trying to Produce blocks of batch x.
+
                     self.exec_state = if let Some(batch) = batch_opt {
                         ExecutionState::ProducingBlocks(Some(batch))
                     } else {
@@ -963,6 +1002,7 @@ impl RecordBatchStream for GroupedHashAggregateStream {
 
 impl GroupedHashAggregateStream {
     /// Perform group-by aggregation for the given [`RecordBatch`].
+    /// Important function to understand
     fn group_aggregate_batch(&mut self, batch: RecordBatch) -> Result<()> {
         // Evaluate the grouping expressions
         let group_by_values = if self.spill_state.is_stream_merging {
@@ -1073,12 +1113,29 @@ impl GroupedHashAggregateStream {
     /// Create an output RecordBatch with the group keys and
     /// accumulator states/values specified in emit_to
     fn emit(&mut self, emit_to: EmitTo, spilling: bool) -> Result<Option<RecordBatch>> {
+        // Log memory BEFORE emit
+        let acc_size_before = self.accumulators.iter().map(|x| x.size()).sum::<usize>();
+        let total_mem_before = acc_size_before
+            + self.group_values.size()
+            + self.group_ordering.size()
+            + self.current_group_indices.allocated_size();
+        
+        log::info!(
+            "[MEMORY] BEFORE emit({:?}): total={}KB (accumulators={}KB, group_values={}KB, num_groups={})",
+            emit_to,
+            total_mem_before / 1024,
+            acc_size_before / 1024,
+            self.group_values.size() / 1024,
+            self.group_values.len()
+        );
+
         let schema = if spilling {
             Arc::clone(&self.spill_state.spill_schema)
         } else {
             self.schema()
         };
         if self.group_values.is_empty() {
+            log::info!("[MEMORY] emit({:?}): group_values is empty, returning None", emit_to);
             return Ok(None);
         }
 
@@ -1108,27 +1165,33 @@ impl GroupedHashAggregateStream {
         let _ = self.update_memory_reservation();
         let batch = RecordBatch::try_new(schema, output)?;
         debug_assert!(batch.num_rows() > 0);
+        
+        // Log memory AFTER emit
+        let acc_size_after = self.accumulators.iter().map(|x| x.size()).sum::<usize>();
+        let total_mem_after = acc_size_after
+            + self.group_values.size()
+            + self.group_ordering.size()
+            + self.current_group_indices.allocated_size();
+        
+        log::info!(
+            "[MEMORY] AFTER emit({:?}): total={}KB (accumulators={}KB, group_values={}KB, num_groups={}), emitted_rows={}, memory_freed={}KB",
+            emit_to,
+            total_mem_after / 1024,
+            acc_size_after / 1024,
+            self.group_values.size() / 1024,
+            self.group_values.len(),
+            batch.num_rows(),
+            (total_mem_before.saturating_sub(total_mem_after)) / 1024
+        );
+        
         Ok(Some(batch))
     }
 
     /// Optimistically, [`Self::group_aggregate_batch`] allows to exceed the memory target slightly
     /// (~ 1 [`RecordBatch`]) for simplicity. In such cases, spill the data to disk and clear the
     /// memory. Currently only [`GroupOrdering::None`] is supported for spilling.
-    fn spill_previous_if_necessary(&mut self, batch: &RecordBatch) -> Result<()> {
-        // TODO: support group_ordering for spilling
-        if !self.group_values.is_empty()
-            && batch.num_rows() > 0
-            && matches!(self.group_ordering, GroupOrdering::None)
-            && !self.spill_state.is_stream_merging
-            && self.update_memory_reservation().is_err()
-        {
-            assert_ne!(self.mode, AggregateMode::Partial);
-            // TODO: support spilling when blocked group optimization is on
-            // (`enable_blocked_groups` is true)
-            assert!(!self.enable_blocked_groups);
-            self.spill()?;
-            self.clear_shrink(batch);
-        }
+    fn spill_previous_if_necessary(&mut self, _batch: &RecordBatch) -> Result<()> {
+        // Spilling disabled
         Ok(())
     }
 
