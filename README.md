@@ -1,155 +1,139 @@
-<!---
-  Licensed to the Apache Software Foundation (ASF) under one
-  or more contributor license agreements.  See the NOTICE file
-  distributed with this work for additional information
-  regarding copyright ownership.  The ASF licenses this file
-  to you under the Apache License, Version 2.0 (the
-  "License"); you may not use this file except in compliance
-  with the License.  You may obtain a copy of the License at
+# Aggregation + TopK Debugging Setup
 
-    http://www.apache.org/licenses/LICENSE-2.0
+Complete debugging environment for understanding DataFusion's aggregation and TopK interaction.
 
-  Unless required by applicable law or agreed to in writing,
-  software distributed under the License is distributed on an
-  "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-  KIND, either express or implied.  See the License for the
-  specific language governing permissions and limitations
-  under the License.
--->
+## 🚀 Quick Start
 
-# Apache DataFusion
+```bash
+./run_agg_topk_debug.sh
+```
 
-[![Crates.io][crates-badge]][crates-url]
-[![Apache licensed][license-badge]][license-url]
-[![Build Status][actions-badge]][actions-url]
-![Commit Activity][commit-activity-badge]
-[![Open Issues][open-issues-badge]][open-issues-url]
-[![Discord chat][discord-badge]][discord-url]
-[![Linkedin][linkedin-badge]][linkedin-url]
-![Crates.io MSRV][msrv-badge]
+## 📖 Documentation
 
-[crates-badge]: https://img.shields.io/crates/v/datafusion.svg
-[crates-url]: https://crates.io/crates/datafusion
-[license-badge]: https://img.shields.io/badge/license-Apache%20v2-blue.svg
-[license-url]: https://github.com/apache/datafusion/blob/main/LICENSE.txt
-[actions-badge]: https://github.com/apache/datafusion/actions/workflows/rust.yml/badge.svg
-[actions-url]: https://github.com/apache/datafusion/actions?query=branch%3Amain
-[discord-badge]: https://img.shields.io/badge/Chat-Discord-purple
-[discord-url]: https://discord.com/invite/Qw5gKqHxUM
-[commit-activity-badge]: https://img.shields.io/github/commit-activity/m/apache/datafusion
-[open-issues-badge]: https://img.shields.io/github/issues-raw/apache/datafusion
-[open-issues-url]: https://github.com/apache/datafusion/issues
-[linkedin-badge]: https://img.shields.io/badge/Follow-Linkedin-blue
-[linkedin-url]: https://www.linkedin.com/company/apache-datafusion/
-[msrv-badge]: https://img.shields.io/crates/msrv/datafusion?label=Min%20Rust%20Version
+**New here?** → [START_HERE.md](START_HERE.md)
 
-[Website](https://datafusion.apache.org/) |
-[API Docs](https://docs.rs/datafusion/latest/datafusion/) |
-[Chat](https://discord.com/channels/885562378132000778/885562378132000781)
+**5-minute start?** → [GET_STARTED.md](GET_STARTED.md)
 
-<a href="https://datafusion.apache.org/">
-  <img src="https://github.com/apache/datafusion/raw/HEAD/docs/source/_static/images/2x_bgwhite_original.png" width="512" alt="logo"/>
-</a>
+**Full index?** → [INDEX.md](INDEX.md)
 
-DataFusion is an extensible query engine written in [Rust] that
-uses [Apache Arrow] as its in-memory format.
+## 📚 Key Documents
 
-This crate provides libraries and binaries for developers building fast and
-feature rich database and analytic systems, customized to particular workloads.
-See [use cases] for examples. The following related subprojects target end users:
+| Document | Purpose |
+|----------|---------|
+| [START_HERE.md](START_HERE.md) | Main entry point |
+| [GET_STARTED.md](GET_STARTED.md) | 5-minute quick start |
+| [LOGGING_GUIDE.md](LOGGING_GUIDE.md) | Complete log reference ⭐ |
+| [FLOW_DIAGRAM.md](FLOW_DIAGRAM.md) | Visual diagrams |
+| [QUICK_REFERENCE.md](QUICK_REFERENCE.md) | Cheat sheet |
 
-- [DataFusion Python](https://github.com/apache/datafusion-python/) offers a Python interface for SQL and DataFrame
-  queries.
-- [DataFusion Ray](https://github.com/apache/datafusion-ray/) provides a distributed version of DataFusion that scales
-  out on Ray clusters.
-- [DataFusion Comet](https://github.com/apache/datafusion-comet/) is an accelerator for Apache Spark based on
-  DataFusion.
+## 🎯 What This Does
 
-"Out of the box,"
-DataFusion offers [SQL] and [`Dataframe`] APIs, excellent [performance],
-built-in support for CSV, Parquet, JSON, and Avro, extensive customization, and
-a great community.
+Helps you understand:
+- How groups are stored in aggregation
+- When and why EmitTo is called
+- How batches flow between operators
+- Memory usage at each stage
+- TopK heap operations
 
-DataFusion features a full query planner, a columnar, streaming, multi-threaded,
-vectorized execution engine, and partitioned data sources. You can
-customize DataFusion at almost all points including additional data sources,
-query languages, functions, custom operators and more.
-See the [Architecture] section for more details.
+## 📊 Example Output
 
-[rust]: http://rustlang.org
-[apache arrow]: https://arrow.apache.org
-[use cases]: https://datafusion.apache.org/user-guide/introduction.html#use-cases
-[python bindings]: https://github.com/apache/datafusion-python
-[performance]: https://benchmark.clickhouse.com/
-[architecture]: https://datafusion.apache.org/contributor-guide/architecture.html
+```
+[AGG-FINAL] Received input batch: rows=8192
+[AGG-BATCH] Created 1523 new groups
+[AGG-FINAL] Hit soft group limit: groups=10
+[MEMORY] BEFORE emit(All): total=289KB
+[MEMORY] AFTER emit: emitted_rows=10, memory_freed=285KB
+[AGG-OUTPUT] ✓ Returning batch to upstream: rows=10
+[TOPK-INSERT] ▼ Receiving batch: rows=10, heap=0/10
+[TOPK-INSERT] ✓ Batch processed: heap=10/10
+[TOPK-EMIT] ✓ Emission complete: 1 output batches
+```
 
-Here are links to some important information
+## 🔧 What Was Created
 
-- [Project Site](https://datafusion.apache.org/)
-- [Installation](https://datafusion.apache.org/user-guide/cli/installation.html)
-- [Rust Getting Started](https://datafusion.apache.org/user-guide/example-usage.html)
-- [Rust DataFrame API](https://datafusion.apache.org/user-guide/dataframe.html)
-- [Rust API docs](https://docs.rs/datafusion/latest/datafusion)
-- [Rust Examples](https://github.com/apache/datafusion/tree/main/datafusion-examples)
-- [Python DataFrame API](https://arrow.apache.org/datafusion-python/)
-- [Architecture](https://docs.rs/datafusion/latest/datafusion/index.html#architecture)
+- ✅ 14 documentation files (~150 pages)
+- ✅ 1 test file with your query
+- ✅ 1 test runner script
+- ✅ Comprehensive logging in source files
 
-## What can you do with this crate?
+## 💡 Quick Commands
 
-DataFusion is great for building projects such as domain specific query engines, new database platforms and data pipelines, query languages and more.
-It lets you start quickly from a fully working engine, and then customize those features specific to your use. [Click Here](https://datafusion.apache.org/user-guide/introduction.html#known-users) to see a list known users.
+```bash
+# Run with clean output
+./run_agg_topk_debug.sh
 
-## Contributing to DataFusion
+# Run with detailed output
+./run_agg_topk_debug.sh debug
 
-Please see the [contributor guide] and [communication] pages for more information.
+# See only aggregation
+./run_agg_topk_debug.sh | grep '\[AGG-'
 
-[contributor guide]: https://datafusion.apache.org/contributor-guide
-[communication]: https://datafusion.apache.org/contributor-guide/communication.html
+# See only TopK
+./run_agg_topk_debug.sh | grep '\[TOPK-'
+```
 
-## Crate features
+## 🗺️ Navigation
 
-This crate has several [features] which can be specified in your `Cargo.toml`.
+```
+README.md (You are here!)
+    ↓
+START_HERE.md (Choose your path)
+    ↓
+GET_STARTED.md (5-minute start)
+    ↓
+LOGGING_GUIDE.md (Understand logs)
+    ↓
+FLOW_DIAGRAM.md (See architecture)
+```
 
-[features]: https://doc.rust-lang.org/cargo/reference/features.html
+## 🆘 Need Help?
 
-Default features:
+- **Quick question?** → [QUICK_REFERENCE.md](QUICK_REFERENCE.md)
+- **Log unclear?** → [LOGGING_GUIDE.md](LOGGING_GUIDE.md)
+- **Architecture?** → [FLOW_DIAGRAM.md](FLOW_DIAGRAM.md)
+- **Full index?** → [INDEX.md](INDEX.md)
 
-- `nested_expressions`: functions for working with nested type function such as `array_to_string`
-- `compression`: reading files compressed with `xz2`, `bzip2`, `flate2`, and `zstd`
-- `crypto_expressions`: cryptographic functions such as `md5` and `sha256`
-- `datetime_expressions`: date and time functions such as `to_timestamp`
-- `encoding_expressions`: `encode` and `decode` functions
-- `parquet`: support for reading the [Apache Parquet] format
-- `regex_expressions`: regular expression functions, such as `regexp_match`
-- `unicode_expressions`: Include unicode aware functions such as `character_length`
-- `unparser`: enables support to reverse LogicalPlans back into SQL
-- `recursive_protection`: uses [recursive](https://docs.rs/recursive/latest/recursive/) for stack overflow protection.
+## 🎓 Learning Paths
 
-Optional features:
+### Beginner (15 min)
+1. [START_HERE.md](START_HERE.md)
+2. Run `./run_agg_topk_debug.sh`
+3. [GET_STARTED.md](GET_STARTED.md)
 
-- `avro`: support for reading the [Apache Avro] format
-- `backtrace`: include backtrace information in error messages
-- `pyarrow`: conversions between PyArrow and DataFusion types
-- `serde`: enable arrow-schema's `serde` feature
+### Intermediate (1 hour)
+1. [COMPLETE_SETUP_SUMMARY.md](COMPLETE_SETUP_SUMMARY.md)
+2. [LOGGING_GUIDE.md](LOGGING_GUIDE.md)
+3. [FLOW_DIAGRAM.md](FLOW_DIAGRAM.md)
 
-[apache avro]: https://avro.apache.org/
-[apache parquet]: https://parquet.apache.org/
+### Advanced (2+ hours)
+1. [AGGREGATION_TOPK_DEBUG_GUIDE.md](AGGREGATION_TOPK_DEBUG_GUIDE.md)
+2. [CUSTOM_INSTRUMENTATION_EXAMPLE.md](CUSTOM_INSTRUMENTATION_EXAMPLE.md)
+3. Add your own logging
 
-## DataFusion API Evolution and Deprecation Guidelines
+## ✨ Features
 
-Public methods in Apache DataFusion evolve over time: while we try to maintain a
-stable API, we also improve the API over time. As a result, we typically
-deprecate methods before removing them, according to the [deprecation guidelines].
+- Comprehensive logging with consistent prefixes
+- Multiple logging levels (info, debug, trace)
+- Easy filtering by component
+- Visual architecture diagrams
+- Complete documentation
+- Debugging scenarios
+- Custom instrumentation examples
 
-[deprecation guidelines]: https://datafusion.apache.org/library-user-guide/api-health.html
+## 🎯 Success Criteria
 
-## Dependencies and `Cargo.lock`
+You'll know it's working when you can:
+- ✅ Run the test successfully
+- ✅ See and understand log messages
+- ✅ Track batches through the system
+- ✅ Explain EmitTo triggers
+- ✅ Monitor memory usage
+- ✅ Debug issues independently
 
-Following the [guidance] on committing `Cargo.lock` files, this project commits
-its `Cargo.lock` file.
+---
 
-CI uses the committed `Cargo.lock` file, and dependencies are updated regularly
-using [Dependabot] PRs.
+**Ready to start?** → [START_HERE.md](START_HERE.md)
 
-[guidance]: https://blog.rust-lang.org/2023/08/29/committing-lockfiles.html
-[dependabot]: https://docs.github.com/en/code-security/dependabot/working-with-dependabot
+**Just want to run it?** → `./run_agg_topk_debug.sh`
+
+**Need the full picture?** → [FINAL_SUMMARY.md](FINAL_SUMMARY.md)

@@ -192,6 +192,18 @@ impl TopK {
         // Updates on drop
         let baseline = self.metrics.baseline.clone();
         let _timer = baseline.elapsed_compute().timer();
+        
+        let batch_rows = batch.num_rows();
+        let heap_size_before = self.heap.inner.len();
+        let memory_before = self.size();
+        
+        log::info!(
+            "[TOPK-INSERT] ▼ Receiving batch from aggregation: rows={}, current_heap={}/{}, memory={}KB",
+            batch_rows,
+            heap_size_before,
+            self.heap.k,
+            memory_before / 1024
+        );
 
         let sort_keys: Vec<ArrayRef> = self
             .expr
@@ -206,35 +218,72 @@ impl TopK {
         let rows = &mut self.scratch_rows;
         rows.clear();
         self.row_converter.append(rows, &sort_keys)?;
+        
+        log::debug!(
+            "[TOPK-INSERT] Converted {} rows to sort keys",
+            rows.len()
+        );
 
         // TODO make this algorithmically better?:
         // Idea: filter out rows >= self.heap.max() early (before passing to `RowConverter`)
         //       this avoids some work and also might be better vectorizable.
         let mut batch_entry = self.heap.register_batch(batch.clone());
+        let mut rows_added = 0;
+        let mut rows_rejected = 0;
+        
         for (index, row) in rows.iter().enumerate() {
             match self.heap.max() {
                 // heap has k items, and the new row is greater than the
                 // current max in the heap ==> it is not a new topk
-                Some(max_row) if row.as_ref() >= max_row.row() => {}
+                Some(max_row) if row.as_ref() >= max_row.row() => {
+                    rows_rejected += 1;
+                }
                 // don't yet have k items or new item is lower than the currently k low values
                 None | Some(_) => {
                     self.heap.add(&mut batch_entry, row, index);
                     self.metrics.row_replacements.add(1);
+                    rows_added += 1;
                 }
             }
         }
+        
+        log::debug!(
+            "[TOPK-INSERT] Processed rows: added={}, rejected={}, heap_now={}/{}",
+            rows_added,
+            rows_rejected,
+            self.heap.inner.len(),
+            self.heap.k
+        );
+        
         self.heap.insert_batch_entry(batch_entry);
 
         // conserve memory
-        self.heap.maybe_compact()?;
+        let compacted = self.heap.maybe_compact()?;
 
         // update memory reservation
-        self.reservation.try_resize(self.size())?;
+        let memory_after = self.size();
+        self.reservation.try_resize(memory_after)?;
+        
+        log::info!(
+            "[TOPK-INSERT] ✓ Batch processed: heap={}/{}, memory={}KB (Δ{:+}KB), store_batches={}, replacements_total={}",
+            self.heap.inner.len(),
+            self.heap.k,
+            memory_after / 1024,
+            (memory_after as i64 - memory_before as i64) / 1024,
+            self.heap.store.len(),
+            self.metrics.row_replacements.value()
+        );
 
         // flag the topK as finished if we know that all
         // subsequent batches are guaranteed to be greater (by byte order, after row conversion) than the top K,
         // which means the top K won't change and the computation can be finished early.
         self.attempt_early_completion(&batch)?;
+        
+        if self.finished {
+            log::info!(
+                "[TOPK-INSERT] ⚠ Early termination triggered - TopK is finished!"
+            );
+        }
 
         Ok(())
     }
@@ -252,13 +301,23 @@ impl TopK {
         // prefix_row_converter is only `Some` if the input ordering has a common prefix with the TopK,
         // so early exit if it is `None`.
         let Some(prefix_converter) = &self.common_sort_prefix_converter else {
+            log::debug!("[TOPK-EARLY] No common sort prefix, cannot attempt early completion");
             return Ok(());
         };
 
         // Early exit if the heap is not full (`heap.max()` only returns `Some` if the heap is full).
         let Some(max_topk_row) = self.heap.max() else {
+            log::debug!(
+                "[TOPK-EARLY] Heap not full yet ({}/{}), cannot attempt early completion",
+                self.heap.inner.len(),
+                self.heap.k
+            );
             return Ok(());
         };
+        
+        log::debug!(
+            "[TOPK-EARLY] Checking early completion: heap is full, has common prefix"
+        );
 
         // Evaluate the prefix for the last row of the current batch.
         let last_row_idx = batch.num_rows() - 1;
@@ -284,7 +343,14 @@ impl TopK {
 
         // If the last row's prefix is strictly greater than the max prefix, mark as finished.
         if batch_prefix_scratch.row(0).as_ref() > heap_prefix_scratch.row(0).as_ref() {
+            log::info!(
+                "[TOPK-EARLY] ✓ Early completion triggered: last batch row prefix > max heap row prefix"
+            );
             self.finished = true;
+        } else {
+            log::debug!(
+                "[TOPK-EARLY] Cannot finish early: last batch row prefix <= max heap row prefix"
+            );
         }
 
         Ok(())
@@ -330,23 +396,53 @@ impl TopK {
             finished: _,
         } = self;
         let _timer = metrics.baseline.elapsed_compute().timer(); // time updated on drop
+        
+        log::info!(
+            "[TOPK-EMIT] Starting final emission: heap_size={}, batch_size={}",
+            heap.inner.len(),
+            batch_size
+        );
 
         // break into record batches as needed
         let mut batches = vec![];
         if let Some(mut batch) = heap.emit()? {
-            metrics.baseline.output_rows().add(batch.num_rows());
+            let total_rows = batch.num_rows();
+            metrics.baseline.output_rows().add(total_rows);
+            
+            log::info!(
+                "[TOPK-EMIT] Emitted single batch with {} rows, splitting into batch_size={}",
+                total_rows,
+                batch_size
+            );
 
             loop {
                 if batch.num_rows() <= batch_size {
+                    log::debug!(
+                        "[TOPK-EMIT] Final chunk: {} rows",
+                        batch.num_rows()
+                    );
                     batches.push(Ok(batch));
                     break;
                 } else {
+                    log::debug!(
+                        "[TOPK-EMIT] Chunk: {} rows (remaining: {})",
+                        batch_size,
+                        batch.num_rows() - batch_size
+                    );
                     batches.push(Ok(batch.slice(0, batch_size)));
                     let remaining_length = batch.num_rows() - batch_size;
                     batch = batch.slice(batch_size, remaining_length);
                 }
             }
-        };
+        } else {
+            log::info!("[TOPK-EMIT] No rows to emit (heap was empty)");
+        }
+        
+        log::info!(
+            "[TOPK-EMIT] ✓ Emission complete: {} output batches",
+            batches.len()
+        );
+        
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
             futures::stream::iter(batches),
@@ -525,12 +621,29 @@ impl TopKHeap {
         // batches might be partially full
         let max_unused_rows = (20 * self.batch_size) + self.k;
         let unused_rows = self.store.unused_rows();
+        
+        log::debug!(
+            "[TOPK-COMPACT] Checking compaction: store_batches={}, unused_rows={}, threshold={}",
+            self.store.len(),
+            unused_rows,
+            max_unused_rows
+        );
 
         // don't compact if the store has one extra batch or
         // unused rows is under the threshold
         if self.store.len() <= 2 || unused_rows < max_unused_rows {
             return Ok(());
         }
+        
+        let old_batch_count = self.store.len();
+        let old_size = self.store.size();
+        
+        log::info!(
+            "[TOPK-COMPACT] Starting compaction: old_batches={}, unused_rows={}, memory={}KB",
+            old_batch_count,
+            unused_rows,
+            old_size / 1024
+        );
         // at first, compact the entire thing always into a new batch
         // (maybe we can get fancier in the future about ignoring
         // batches that have a high usage ratio already
@@ -559,6 +672,13 @@ impl TopKHeap {
         self.insert_batch_entry(batch_entry);
         // restore the heap
         self.inner = BinaryHeap::from(topk_rows);
+        
+        let new_size = self.store.size();
+        log::info!(
+            "[TOPK-COMPACT] ✓ Compaction complete: new_batches=1, memory={}KB, saved={}KB",
+            new_size / 1024,
+            (old_size.saturating_sub(new_size)) / 1024
+        );
 
         Ok(())
     }

@@ -783,9 +783,21 @@ impl Stream for GroupedHashAggregateStream {
                         Some(Ok(batch)) if self.mode == AggregateMode::Partial => {
                             let timer = elapsed_compute.timer();
                             let input_rows = batch.num_rows();
+                            
+                            log::info!(
+                                "[AGG-PARTIAL] Received input batch: rows={}, current_groups={}",
+                                input_rows,
+                                self.group_values.len()
+                            );
 
                             // Do the grouping
                             self.group_aggregate_batch(batch)?;
+                            
+                            log::info!(
+                                "[AGG-PARTIAL] After aggregation: total_groups={}, memory={}KB",
+                                self.group_values.len(),
+                                self.reservation.size() / 1024
+                            );
 
                             self.update_skip_aggregation_probe(input_rows);
 
@@ -796,6 +808,11 @@ impl Stream for GroupedHashAggregateStream {
                             // If the number of group values equals or exceeds the soft limit,
                             // emit all groups and switch to producing output
                             if self.hit_soft_group_limit() {
+                                log::info!(
+                                    "[AGG-PARTIAL] Hit soft group limit: groups={}, limit={:?}",
+                                    self.group_values.len(),
+                                    self.group_values_soft_limit
+                                );
                                 timer.done();
                                 self.set_input_done_and_produce_output()?;
                                 // make sure the exec_state just set is not overwritten below
@@ -803,8 +820,16 @@ impl Stream for GroupedHashAggregateStream {
                             }
 
                             if let Some(to_emit) = self.group_ordering.emit_to() {
+                                log::info!(
+                                    "[AGG-PARTIAL] Group ordering triggered emit: emit_to={:?}",
+                                    to_emit
+                                );
                                 timer.done();
                                 if let Some(batch) = self.emit(to_emit, false)? {
+                                    log::info!(
+                                        "[AGG-PARTIAL] Emitted batch: rows={}, switching to ProducingOutput",
+                                        batch.num_rows()
+                                    );
                                     self.exec_state =
                                         ExecutionState::ProducingOutput(batch);
                                 };
@@ -823,6 +848,14 @@ impl Stream for GroupedHashAggregateStream {
                         // (Final/FinalPartitioned/Single/SinglePartitioned)
                         Some(Ok(batch)) => {
                             let timer = elapsed_compute.timer();
+                            let input_rows = batch.num_rows();
+                            
+                            log::info!(
+                                "[AGG-FINAL] Received input batch: rows={}, current_groups={}, mode={:?}",
+                                input_rows,
+                                self.group_values.len(),
+                                self.mode
+                            );
 
                             // Make sure we have enough capacity for `batch`, otherwise spill
                             self.spill_previous_if_necessary(&batch)?;
@@ -830,6 +863,12 @@ impl Stream for GroupedHashAggregateStream {
                             // Do the grouping
                             // Understand this code --> Forms group and update the Accumulators
                             self.group_aggregate_batch(batch)?;
+                            
+                            log::info!(
+                                "[AGG-FINAL] After aggregation: total_groups={}, memory={}KB",
+                                self.group_values.len(),
+                                self.reservation.size() / 1024
+                            );
 
                             // If we can begin emitting rows, do so,
                             // otherwise keep consuming input
@@ -839,6 +878,11 @@ impl Stream for GroupedHashAggregateStream {
                             // emit all groups and switch to producing output
                             // How soft group limit hit is coming into play here?
                             if self.hit_soft_group_limit() {
+                                log::info!(
+                                    "[AGG-FINAL] Hit soft group limit: groups={}, limit={:?}, triggering emission",
+                                    self.group_values.len(),
+                                    self.group_values_soft_limit
+                                );
                                 timer.done();
                                 self.set_input_done_and_produce_output()?;
                                 // make sure the exec_state just set is not overwritten below
@@ -847,8 +891,17 @@ impl Stream for GroupedHashAggregateStream {
 
                             // How emit to is working here?
                             if let Some(to_emit) = self.group_ordering.emit_to() {
+                                log::info!(
+                                    "[AGG-FINAL] Group ordering triggered emit: emit_to={:?}, groups={}",
+                                    to_emit,
+                                    self.group_values.len()
+                                );
                                 timer.done();
                                 if let Some(batch) = self.emit(to_emit, false)? {
+                                    log::info!(
+                                        "[AGG-FINAL] Emitted batch: rows={}, switching to ProducingOutput",
+                                        batch.num_rows()
+                                    );
                                     self.exec_state =
                                         ExecutionState::ProducingOutput(batch);
                                 };
@@ -900,33 +953,59 @@ impl Stream for GroupedHashAggregateStream {
                     // slice off a part of the batch, if needed
                     let output_batch;
                     let size = self.batch_size;
+                    
+                    log::debug!(
+                        "[AGG-OUTPUT] ProducingOutput: batch_rows={}, batch_size={}, input_done={}",
+                        batch.num_rows(),
+                        size,
+                        self.input_done
+                    );
+                    
                     (self.exec_state, output_batch) = if batch.num_rows() <= size {
-                        (
-                            if self.input_done {
-                                ExecutionState::Done
-                            }
-                            // In Partial aggregation, we also need to check
-                            // if we should trigger partial skipping
-                            else if self.mode == AggregateMode::Partial
-                                && self.should_skip_aggregation()
-                            {
-                                ExecutionState::SkippingAggregation
-                            } else {
-                                ExecutionState::ReadingInput
-                            },
-                            batch.clone(),
-                        )
+                        let next_state = if self.input_done {
+                            ExecutionState::Done
+                        }
+                        // In Partial aggregation, we also need to check
+                        // if we should trigger partial skipping
+                        else if self.mode == AggregateMode::Partial
+                            && self.should_skip_aggregation()
+                        {
+                            ExecutionState::SkippingAggregation
+                        } else {
+                            ExecutionState::ReadingInput
+                        };
+                        
+                        log::info!(
+                            "[AGG-OUTPUT] Emitting final chunk: rows={}, next_state={:?}",
+                            batch.num_rows(),
+                            next_state
+                        );
+                        
+                        (next_state, batch.clone())
                     } else {
                         // output first batch_size rows
                         let size = self.batch_size;
                         let num_remaining = batch.num_rows() - size;
                         let remaining = batch.slice(size, num_remaining);
                         let output = batch.slice(0, size);
+                        
+                        log::info!(
+                            "[AGG-OUTPUT] Emitting chunk: rows={}, remaining={}",
+                            output.num_rows(),
+                            remaining.num_rows()
+                        );
+                        
                         (ExecutionState::ProducingOutput(remaining), output)
                     };
                     // Empty record batches should not be emitted.
                     // They need to be treated as  [`Option<RecordBatch>`]es and handled separately
                     debug_assert!(output_batch.num_rows() > 0);
+                    
+                    log::info!(
+                        "[AGG-OUTPUT] ✓ Returning batch to upstream: rows={}",
+                        output_batch.num_rows()
+                    );
+                    
                     return Poll::Ready(Some(Ok(
                         output_batch.record_output(&self.baseline_metrics)
                     )));
@@ -1004,6 +1083,15 @@ impl GroupedHashAggregateStream {
     /// Perform group-by aggregation for the given [`RecordBatch`].
     /// Important function to understand
     fn group_aggregate_batch(&mut self, batch: RecordBatch) -> Result<()> {
+        let batch_rows = batch.num_rows();
+        let groups_before = self.group_values.len();
+        
+        log::debug!(
+            "[AGG-BATCH] Starting group_aggregate_batch: input_rows={}, existing_groups={}",
+            batch_rows,
+            groups_before
+        );
+        
         // Evaluate the grouping expressions
         let group_by_values = if self.spill_state.is_stream_merging {
             evaluate_group_by(&self.spill_state.merging_group_by, &batch)?
@@ -1036,6 +1124,13 @@ impl GroupedHashAggregateStream {
             // Update ordering information if necessary
             let total_num_groups = self.group_values.len();
             if total_num_groups > starting_num_groups {
+                let new_groups = total_num_groups - starting_num_groups;
+                log::debug!(
+                    "[AGG-BATCH] Created {} new groups (total now: {})",
+                    new_groups,
+                    total_num_groups
+                );
+                
                 self.group_ordering.new_groups(
                     group_values,
                     group_indices,
@@ -1246,12 +1341,29 @@ impl GroupedHashAggregateStream {
             && matches!(self.group_ordering, GroupOrdering::None)
             && self.update_memory_reservation().is_err()
         {
+            log::info!(
+                "[AGG-EARLY-EMIT] Memory pressure detected: groups={}, batch_size={}, triggering early emission",
+                self.group_values.len(),
+                self.batch_size
+            );
+            
             assert_eq!(self.mode, AggregateMode::Partial);
             // TODO: support spilling when blocked group optimization is on
             // (`enable_blocked_groups` is true)
             assert!(!self.enable_blocked_groups);
             let n = self.group_values.len() / self.batch_size * self.batch_size;
+            
+            log::info!(
+                "[AGG-EARLY-EMIT] Emitting first {} groups (keeping {} groups)",
+                n,
+                self.group_values.len() - n
+            );
+            
             if let Some(batch) = self.emit(EmitTo::First(n), false)? {
+                log::info!(
+                    "[AGG-EARLY-EMIT] Early emission produced batch with {} rows",
+                    batch.num_rows()
+                );
                 self.exec_state = ExecutionState::ProducingOutput(batch);
             };
         }
