@@ -22,6 +22,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::integer_in_list::{
+    IntegerInListPruningExpr, is_supported_int_type, scalar_to_i128,
+};
 use crate::string_in_list::StringInListPruningExpr;
 
 use arrow::array::AsArray;
@@ -1511,6 +1514,62 @@ fn build_string_in_list_expr(
     )))
 }
 
+/// Keep large literal integer domains compact instead of building an OR tree.
+/// Analogous to [`build_string_in_list_expr`] for integer-like types.
+fn build_integer_in_list_expr(
+    in_list: &phys_expr::InListExpr,
+    schema: &Schema,
+    required_columns: &mut RequiredColumns,
+) -> Option<Arc<dyn PhysicalExpr>> {
+    if in_list.negated() {
+        return None;
+    }
+    let column = in_list.expr().downcast_ref::<phys_expr::Column>()?;
+    let field = schema.fields().get(column.index())?;
+    let data_type = match field.data_type() {
+        DataType::Dictionary(_, value) => value.as_ref(),
+        data_type => data_type,
+    };
+    if field.name() != column.name() || !is_supported_int_type(data_type) {
+        return None;
+    }
+    // Extract i128 values from literals. Any NULL means we cannot use this path
+    // (same reasoning as string path: NULL in the IN list makes three-valued
+    // logic non-trivial for the inverse predicate).
+    let values = in_list
+        .list()
+        .iter()
+        .map(|expr| {
+            expr.downcast_ref::<phys_expr::Literal>()
+                .and_then(|lit| scalar_to_i128(lit.value()))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    // Defensive: an empty domain cannot prune anything and violates the
+    // IntegerInListPruningExpr invariant.
+    if values.is_empty() {
+        return None;
+    }
+    let min = required_columns
+        .min_column_expr(column, in_list.expr(), field)
+        .ok()?;
+    let max = required_columns
+        .max_column_expr(column, in_list.expr(), field)
+        .ok()?;
+    let non_null =
+        build_is_null_column_expr(in_list.expr(), schema, required_columns, true)?;
+    let intersects = Arc::new(IntegerInListPruningExpr::new(
+        min,
+        max,
+        values,
+        data_type.clone(),
+    ));
+    Some(Arc::new(phys_expr::BinaryExpr::new(
+        non_null,
+        Operator::And,
+        intersects,
+    )))
+}
+
 /// Default maximum number of entries in an `IN (...)` list eligible for
 /// statistics pruning. Eligible positive literal string lists above this
 /// threshold use a compact sorted domain instead of per-value min/max checks.
@@ -1649,6 +1708,13 @@ fn build_predicate_expression(
             && in_list.list().len() <= max_in_list_size
             && let Some(pruning_expr) =
                 build_string_in_list_expr(in_list, schema, required_columns)
+        {
+            return pruning_expr;
+        }
+        if in_list.list().len() > MAX_IN_LIST_SIZE
+            && in_list.list().len() <= max_in_list_size
+            && let Some(pruning_expr) =
+                build_integer_in_list_expr(in_list, schema, required_columns)
         {
             return pruning_expr;
         }
@@ -3546,19 +3612,18 @@ mod tests {
         let rewriter = PredicateRewriter::new().with_max_in_list_size(32);
         let predicate_expr =
             rewriter.rewrite_predicate_to_statistics_predicate(&physical, &schema);
-        // At the raised cap, IN is rewritten into per-value min/max checks
-        // OR'd together; the resulting predicate must not collapse to
-        // `true` (which is what the default cap produces).
+        // At the raised cap, IN is rewritten into a compact integer domain
+        // intersection check (or per-value min/max for strings); the
+        // resulting predicate must not collapse to `true`.
         assert_ne!(
             predicate_expr.to_string(),
             "true",
             "IN(25) with raised cap must rewrite into a statistics-based predicate, not fall through to `true`"
         );
-        // Sanity: the rewritten predicate references per-value literals.
+        // Sanity: the rewritten predicate uses compact integer pruning.
         assert!(
-            predicate_expr.to_string().contains(" <= 1 ")
-                && predicate_expr.to_string().contains(" <= 25 "),
-            "rewritten predicate should include per-value bounds for each IN entry, got: {predicate_expr}"
+            predicate_expr.to_string().contains("INT_IN_SET_INTERSECTS"),
+            "rewritten predicate should use compact integer pruning, got: {predicate_expr}"
         );
         Ok(())
     }
@@ -3606,8 +3671,8 @@ mod tests {
             "default cap must fall through to `true` for 25-item IN"
         );
 
-        // Raising the cap produces a real statistics predicate with per-
-        // value bounds.
+        // Raising the cap produces a real statistics predicate with compact
+        // integer domain pruning.
         let raised_pp = PruningPredicateBuilder::new()
             .with_file_schema(Arc::clone(&schema))
             .with_max_in_list_size(32)
@@ -3618,8 +3683,8 @@ mod tests {
             "raised cap must produce a real statistics predicate for 25-item IN"
         );
         assert!(
-            raised_expr.contains(" <= 1 ") && raised_expr.contains(" <= 25 "),
-            "raised-cap predicate should include per-value bounds, got: {raised_expr}"
+            raised_expr.contains("INT_IN_SET_INTERSECTS"),
+            "raised-cap predicate should use compact integer pruning, got: {raised_expr}"
         );
         Ok(())
     }
